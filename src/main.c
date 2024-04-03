@@ -14,31 +14,18 @@
  */
 
 // Peanut-GB emulator settings
-#define ENABLE_LCD	1
 #define ENABLE_SOUND	1
 #define ENABLE_SDCARD	1
 #define PEANUT_GB_HIGH_LCD_ACCURACY 1
 #define PEANUT_GB_USE_BIOS 0
-
-/* Use DMA for all drawing to LCD. Benefits aren't fully realised at the moment
- * due to busy loops waiting for DMA completion. */
-#define USE_DMA		0
-
-/**
- * Reducing VSYNC calculation to lower multiple.
- * When setting a clock IRQ to DMG_CLOCK_FREQ_REDUCED, count to
- * SCREEN_REFRESH_CYCLES_REDUCED to obtain the time required each VSYNC.
- * DMG_CLOCK_FREQ_REDUCED = 2^18, and SCREEN_REFRESH_CYCLES_REDUCED = 4389.
- * Currently unused.
- */
-#define VSYNC_REDUCTION_FACTOR 16u
-#define SCREEN_REFRESH_CYCLES_REDUCED (SCREEN_REFRESH_CYCLES/VSYNC_REDUCTION_FACTOR)
-#define DMG_CLOCK_FREQ_REDUCED (DMG_CLOCK_FREQ/VSYNC_REDUCTION_FACTOR)
+#define USE_GB3_AUDIO_LIB 0
+#define AUDIO_PWM 0
 
 /* C Headers */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 /* RP2040 Headers */
 #include <hardware/pio.h>
@@ -46,7 +33,6 @@
 #include <hardware/dma.h>
 #include <hardware/spi.h>
 #include <hardware/sync.h>
-#include <hardware/flash.h>
 #include <hardware/timer.h>
 #include <hardware/vreg.h>
 #include <pico/bootrom.h>
@@ -55,31 +41,33 @@
 #include <pico/multicore.h>
 #include <sys/unistd.h>
 #include <hardware/irq.h>
+#include <hardware/pwm.h>
+#include <hardware/gpio.h>
+#include <hardware/flash.h>
+#include <pico/time.h>
 
 /* Project headers */
 #include "hedley.h"
 #include "minigb_apu.h"
 #include "peanut_gb.h"
-#include "mk_ili9225.h"
-#include "sdcard.h"
-#include "i2s.h"
+#include "pico_ST7789.h"
 #include "gbcolors.h"
+#include "audio.h"
+#include "gb3_audio_dma.h"
+#include "config.h"
+#include "sdcard.h"
+#include "lcd_dma.h"
 
-/* GPIO Connections. */
-#define GPIO_UP		2
-#define GPIO_DOWN	3
-#define GPIO_LEFT	4
-#define GPIO_RIGHT	5
-#define GPIO_A		6
-#define GPIO_B		7
-#define GPIO_SELECT	8
-#define GPIO_START	9
-#define GPIO_CS		17
-#define GPIO_CLK	18
-#define GPIO_SDA	19
-#define GPIO_RS		20
-#define GPIO_RST	21
-#define GPIO_LED	22
+// ST7789 Configuration
+const struct st7789_config lcd_config = {
+    .spi      = PICO_DEFAULT_SPI_INSTANCE,
+    .gpio_din = GPIO_SDA,
+    .gpio_clk = GPIO_CLK,
+    .gpio_cs  = GPIO_CS,
+    .gpio_dc  = GPIO_RS,
+    .gpio_rst = GPIO_RST,
+    .gpio_bl  = GPIO_LED
+};
 
 #if ENABLE_SOUND
 /**
@@ -90,6 +78,27 @@
  * This is intended to be played at AUDIO_SAMPLE_RATE Hz
  */
 uint16_t *stream;
+//static uint16_t stream[1098];
+int volume = 256;
+// struct repeating_timer timerWFGenerator;    // Timer for the waveform generator - 125KHz
+int audiopos =0;
+// bool wavegen_callback(struct repeating_timer *t) {
+// 	//audio_mixer_step();
+//     return true;
+// }
+
+#if AUDIO_PWM
+void pwm_interrupt_handler() {
+    pwm_clear_irq(pwm_gpio_to_slice_num(GPIO_AUDIO));    
+	if (audiopos < (AUDIO_SAMPLES<<3) - 1) {
+
+		pwm_set_gpio_level(GPIO_AUDIO, stream[(audiopos+1)>>3]>>8);
+		audiopos+=2;
+	} else {
+		audiopos = 0;
+	}
+}
+#endif
 #endif
 
 /** Definition of ROM data
@@ -98,14 +107,24 @@ uint16_t *stream;
  * Game Boy DMG ROM size ranges from 32768 bytes (e.g. Tetris) to 1,048,576 bytes (e.g. Pokemod Red)
  */
 #define FLASH_TARGET_OFFSET (1024 * 1024)
-const uint8_t *rom = (const uint8_t *) (XIP_BASE + FLASH_TARGET_OFFSET);
-static unsigned char rom_bank0[65536];
-
 static uint8_t ram[32768];
-static int lcd_line_busy = 0;
-static palette_t palette;	// Colour palette
-static uint8_t manual_palette_selected=0;
+static unsigned char rom_bank0[65536];
+const uint8_t *rom = (const uint8_t *) (XIP_BASE + FLASH_TARGET_OFFSET);
 
+uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr);
+uint8_t gb_cart_ram_read(struct gb_s *gb, const uint_fast32_t addr);
+void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr,const uint8_t val);
+void read_cart_ram_file(struct gb_s *gb);
+void write_cart_ram_file(struct gb_s *gb);
+void load_cart_rom_file(char *filename);
+uint16_t rom_file_selector_display_page(char filename[22][256],uint16_t num_page);
+void rom_file_selector();
+
+static int lcd_line_busy = 0;
+static palette_t palette;						// Colour palette
+static uint8_t manual_palette_selected=0;
+static uint8_t lcd_scaling = 1;
+static uint8_t pixels_buffer[LCD_WIDTH];		// Pixel data is stored in here.
 static struct
 {
 	unsigned a	: 1;
@@ -121,56 +140,477 @@ static struct
 /* Multicore command structure. */
 union core_cmd {
     struct {
-	/* Does nothing. */
-#define CORE_CMD_NOP		0
-	/* Set line "data" on the LCD. Pixel data is in pixels_buffer. */
-#define CORE_CMD_LCD_LINE	1
-	/* Control idle mode on the LCD. Limits colours to 2 bits. */
-#define CORE_CMD_IDLE_SET	2
-	/* Set a specific pixel. For debugging. */
-#define CORE_CMD_SET_PIXEL	3
-	uint8_t cmd;
-	uint8_t unused1;
-	uint8_t unused2;
-	uint8_t data;
+		#define CORE_CMD_NOP		0		// Does nothing.
+		#define CORE_CMD_LCD_LINE	1		// Set line "data" on the LCD. Pixel data is in pixels_buffer.
+		uint8_t cmd;
+		uint8_t unused1;
+		uint8_t unused2;
+		uint8_t data;
     };
     uint32_t full;
 };
 
-/* Pixel data is stored in here. */
-static uint8_t pixels_buffer[LCD_WIDTH];
-
-#define putstdio(x) write(1, x, strlen(x))
-
-/* Functions required for communication with the ILI9225. */
-void mk_ili9225_set_rst(bool state)
+/**
+ * Ignore all errors.
+ */
+void gb_error(struct gb_s *gb, const enum gb_error_e gb_err, const uint16_t addr)
 {
-	gpio_put(GPIO_RST, state);
+#if 1
+	const char* gb_err_str[4] = {
+			"UNKNOWN",
+			"INVALID OPCODE",
+			"INVALID READ",
+			"INVALID WRITE"
+		};
+	printf("Error %d occurred: %s at %04X\n.\n", gb_err, gb_err_str[gb_err], addr);
+//	abort();
+#endif
 }
 
-void mk_ili9225_set_rs(bool state)
+void core1_lcd_draw_line(const uint_fast8_t line)
 {
-	gpio_put(GPIO_RS, state);
+	static uint16_t fb[LCD_WIDTH];										// 16-bit frame buffer
+	static uint16_t scaledLineBuffer[SCREEN_WIDTH];
+	memset(scaledLineBuffer, 0, sizeof(scaledLineBuffer));				// Clear the scaled line buffer
+
+	for(unsigned int x = 0; x < LCD_WIDTH; x++)
+	{
+		fb[x] = palette[(pixels_buffer[x] & LCD_PALETTE_ALL) >> 4]
+				[pixels_buffer[x] & 3];
+
+		if (lcd_scaling) {
+			scaledLineBuffer[x*3/2] = fb[x];							// Fill the scaled buffer with pixel skipping
+			if (lcd_scaling == 2) scaledLineBuffer[(x*3/2)-1] = fb[x];	// Fill in skipped pixels
+		} else {
+			scaledLineBuffer[x+40] = fb[x];								// Fill the scaled buffer with an offset
+		}
+	}
+
+	if (lcd_scaling) {													// If we're scaling...
+		st7789_raset(line*3/2, SCREEN_HEIGHT-1);						// Skip every other line
+	} else {															// If we're not scaling...
+	 	st7789_raset(line+48, SCREEN_HEIGHT-1);							// Set the line with an offset from the top of the display
+	}
+	st7789_ramwr();
+	st7789_write_pixels(scaledLineBuffer, SCREEN_WIDTH);				// Write the scaled line buffer to the display
+	if (lcd_scaling == 2 && line % 2 != 0) {							// If we're on an odd line...
+		st7789_write_pixels(scaledLineBuffer, SCREEN_WIDTH);			// Write the scaled line buffer to the display
+	}
+
+	__atomic_store_n(&lcd_line_busy, 0, __ATOMIC_SEQ_CST);
 }
 
-void mk_ili9225_set_cs(bool state)
+_Noreturn
+void main_core1(void)
 {
-	gpio_put(GPIO_CS, state);
+	union core_cmd cmd;
+
+	/* Initialise and control LCD on core 1. */
+	st7789_init(&lcd_config, SCREEN_WIDTH, SCREEN_HEIGHT);				// Initialize ST7789 display
+	st7789_setRotation(1);												// Ribbon cable on left side of display
+	st7789_backlight(true);												// Turn on the backlight
+	st7789_fill(0xFFFF);												// Clear LCD screen
+	st7789_fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 0x0000);			// Clear the portion of the screen with the emulator window
+
+	/* Handle commands coming from core0. */
+	while(1)
+	{
+		 cmd.full = multicore_fifo_pop_blocking();						// Pull data off the queue
+		switch(cmd.cmd)
+		{
+			case CORE_CMD_LCD_LINE:										// We're being told to draw a line
+				core1_lcd_draw_line(cmd.data);							// Draw the line
+				break;
+
+			case CORE_CMD_NOP:
+			default:
+				break;
+		}
+	}
+
+	HEDLEY_UNREACHABLE();
 }
 
-void mk_ili9225_set_led(bool state)
+void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH], const uint_fast8_t line)
 {
-	gpio_put(GPIO_LED, state);
+	union core_cmd cmd;
+
+	/* Wait until previous line is sent. */
+	while(__atomic_load_n(&lcd_line_busy, __ATOMIC_SEQ_CST))
+		tight_loop_contents();
+
+	memcpy(pixels_buffer, pixels, LCD_WIDTH);
+	
+	/* Populate command. */
+	cmd.cmd = CORE_CMD_LCD_LINE;
+	cmd.data = line;
+
+	__atomic_store_n(&lcd_line_busy, 1, __ATOMIC_SEQ_CST);
+	multicore_fifo_push_blocking(cmd.full);
 }
 
-void mk_ili9225_spi_write16(const uint16_t *halfwords, size_t len)
-{
-	spi_write16_blocking(spi0, halfwords, len);
-}
 
-void mk_ili9225_delay_ms(unsigned ms)
+int main(void)
 {
-	sleep_ms(ms);
+	static struct gb_s gb;
+	enum gb_init_error_e ret;
+	
+	/* Overclock. */
+	{
+		const unsigned vco = 1596*1000*1000;	/* 266MHz */
+		const unsigned div1 = 6, div2 = 1;
+
+		vreg_set_voltage(VREG_VOLTAGE_1_15);
+		sleep_ms(2);
+		set_sys_clock_pll(vco, div1, div2);
+		sleep_ms(2);
+	}
+
+	/* Initialise USB serial connection for debugging. */
+	stdio_init_all();
+	time_init();
+
+	/* Initialise GPIO pins. */
+	gpio_set_function(GPIO_UP, GPIO_FUNC_SIO);
+	gpio_set_function(GPIO_DOWN, GPIO_FUNC_SIO);
+	gpio_set_function(GPIO_LEFT, GPIO_FUNC_SIO);
+	gpio_set_function(GPIO_RIGHT, GPIO_FUNC_SIO);
+	gpio_set_function(GPIO_A, GPIO_FUNC_SIO);
+	gpio_set_function(GPIO_B, GPIO_FUNC_SIO);
+	gpio_set_function(GPIO_SELECT, GPIO_FUNC_SIO);
+	gpio_set_function(GPIO_START, GPIO_FUNC_SIO);
+	gpio_set_function(GPIO_CS, GPIO_FUNC_SIO);
+	gpio_set_function(GPIO_CLK, GPIO_FUNC_SPI);
+	gpio_set_function(GPIO_SDA, GPIO_FUNC_SPI);
+	gpio_set_function(GPIO_RS, GPIO_FUNC_SIO);
+	gpio_set_function(GPIO_RST, GPIO_FUNC_SIO);
+	gpio_set_function(GPIO_LED, GPIO_FUNC_SIO);
+
+	gpio_set_dir(GPIO_UP, false);
+	gpio_set_dir(GPIO_DOWN, false);
+	gpio_set_dir(GPIO_LEFT, false);
+	gpio_set_dir(GPIO_RIGHT, false);
+	gpio_set_dir(GPIO_A, false);
+	gpio_set_dir(GPIO_B, false);
+	gpio_set_dir(GPIO_SELECT, false);
+	gpio_set_dir(GPIO_START, false);
+	gpio_set_dir(GPIO_CS, true);
+	gpio_set_dir(GPIO_RS, true);
+	gpio_set_dir(GPIO_RST, true);
+	gpio_set_dir(GPIO_LED, true);
+	gpio_set_slew_rate(GPIO_CLK, GPIO_SLEW_RATE_FAST);
+	gpio_set_slew_rate(GPIO_SDA, GPIO_SLEW_RATE_FAST);
+	
+	gpio_pull_up(GPIO_UP);
+	gpio_pull_up(GPIO_DOWN);
+	gpio_pull_up(GPIO_LEFT);
+	gpio_pull_up(GPIO_RIGHT);
+	gpio_pull_up(GPIO_A);
+	gpio_pull_up(GPIO_B);
+	gpio_pull_up(GPIO_SELECT);
+	gpio_pull_up(GPIO_START);
+
+	/* Set SPI clock to use high frequency. */
+	clock_configure(clk_peri, 0,
+			CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+			125 * 1000 * 1000, 125 * 1000 * 1000);
+	spi_init(spi0, 62*1000*1000);
+	spi_set_format(spi0, 16, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+
+
+	#if ENABLE_SOUND
+		gpio_init(26);								//Audio amp enable (active HIGH)
+		gpio_set_dir(26, GPIO_OUT);
+		gpio_put(26, 1);
+
+		#if AUDIO_PWM
+			gpio_set_function(GPIO_AUDIO, GPIO_FUNC_PWM);
+			int audio_pin_slice = pwm_gpio_to_slice_num(GPIO_AUDIO);
+
+			// Setup PWM interrupt to fire when PWM cycle is complete
+			pwm_clear_irq(audio_pin_slice);
+			pwm_set_irq_enabled(audio_pin_slice, true);
+			// set the handle function above
+			irq_set_exclusive_handler(PWM_IRQ_WRAP, pwm_interrupt_handler); 
+			irq_set_enabled(PWM_IRQ_WRAP, true);
+
+			pwm_config config = pwm_get_default_config();
+			pwm_config_set_clkdiv(&config, 1.0f); 
+			pwm_config_set_wrap(&config, 254); 
+			pwm_init(audio_pin_slice, &config, true);
+			pwm_set_gpio_level(GPIO_AUDIO, 0);
+		#endif
+
+		// Allocate memory for the stream buffer
+		//stream=malloc(AUDIO_BUFFER_SIZE_BYTES);
+		//assert(stream!=NULL);
+		//memset(stream,0,AUDIO_BUFFER_SIZE_BYTES);  // Zero out the stream buffer
+		stream=malloc(2048);
+		assert(stream!=NULL);
+		memset(stream,0,2048);  // Zero out the stream buffer
+
+		// #if !USE_GB3_AUDIO_LIB
+		 	audio_init2(GPIO_AUDIO, AUDIO_SAMPLE_RATE);
+		 	audio_source_set_volume(0, volume);
+		 	audio_play_loop(stream, 512, 0);
+		// #endif
+
+		//add_repeating_timer_us(-64, wavegen_callback, NULL, &timerWFGenerator);
+	#endif
+
+	while(true)
+	{
+		#if ENABLE_SDCARD
+			/* ROM File selector */
+			st7789_init(&lcd_config, SCREEN_WIDTH, SCREEN_HEIGHT);	// Initialize ST7789 display
+			st7789_setRotation(1);									// Ribbon cable on left side of display
+			st7789_backlight(true);									// Turn on the backlight
+
+			st7789_fill(0x0000);
+
+			rom_file_selector();
+		#endif
+
+		/* Initialise GB context. */
+		memcpy(rom_bank0, rom, sizeof(rom_bank0));
+		ret = gb_init(&gb, &gb_rom_read, &gb_cart_ram_read, &gb_cart_ram_write, &gb_error, NULL);
+
+		if(ret != GB_INIT_NO_ERROR)
+		{
+			printf("Error: %d\n", ret);
+			goto out;
+		}
+
+		manual_assign_palette(palette, 12);						// Set to color palette 12 (original GB green)
+		#if AUTO_PALETTE
+			/* Automatically assign a colour palette to the game */
+			char rom_title[16];
+			auto_assign_palette(palette, gb_colour_hash(&gb),gb_get_rom_name(&gb,rom_title));
+		#endif
+	
+		gb_init_lcd(&gb, &lcd_draw_line);
+		multicore_launch_core1(main_core1);				// Start Core1, which processes requests to the LCD
+
+		#if ENABLE_SOUND
+			// Initialize audio emulation
+			audio_init();
+
+			#if USE_GB3_AUDIO_LIB
+				dmaAudioInit();
+				playAudio(stream, 0, AUDIO_SAMPLES);
+			#endif
+		#endif
+
+		#if ENABLE_SDCARD
+			/* Load Save File. */
+			//WKM read_cart_ram_file(&gb);
+		#endif
+
+		uint_fast32_t frames = 0;
+		uint64_t start_time = time_us_64();
+		while(1)
+		{
+			int input;
+
+			gb.gb_frame = 0;
+			
+			do {
+				__gb_step_cpu(&gb);
+				tight_loop_contents();
+			} while(HEDLEY_LIKELY(gb.gb_frame == 0));
+
+			frames++;
+			#if ENABLE_SOUND
+				if(!gb.direct.frame_skip) {
+					audio_callback(NULL, stream, 2048);
+					//audio_callback(NULL, stream, 1098);
+					//UpdateAudioBuffer(stream, AUDIO_SAMPLES);
+
+					#if USE_GB3_AUDIO_LIB
+						serviceAudio();
+					#else
+						audio_mixer_step();
+					#endif
+					//i2s_dma_write(&i2s_config, stream);
+					//audio_play_once(stream, AUDIO_SAMPLES);
+					//audio_mixer_step();
+					//pwm_set_gpio_level(GPIO_AUDIO, stream[sample_rate]);
+					//sample_rate++;
+					//uint slice_num = slice_number;			//Do this once, less math
+					//uint chan = chan_nummber;
+
+					//pwm_set_clkdiv_int_frac(slice_num, 1, 0);
+					//pwm_set_wrap(slice_num, 8000);
+					//pwm_set_chan_level(slice_num, chan, *stream);
+					//pwm_set_enabled(slice_num, true);
+					
+				}
+			#endif
+
+			/* Update buttons state */
+			prev_joypad_bits.up=gb.direct.joypad_bits.up;
+			prev_joypad_bits.down=gb.direct.joypad_bits.down;
+			prev_joypad_bits.left=gb.direct.joypad_bits.left;
+			prev_joypad_bits.right=gb.direct.joypad_bits.right;
+			prev_joypad_bits.a=gb.direct.joypad_bits.a;
+			prev_joypad_bits.b=gb.direct.joypad_bits.b;
+			prev_joypad_bits.select=gb.direct.joypad_bits.select;
+			prev_joypad_bits.start=gb.direct.joypad_bits.start;
+			gb.direct.joypad_bits.up=gpio_get(GPIO_UP);
+			gb.direct.joypad_bits.down=gpio_get(GPIO_DOWN);
+			gb.direct.joypad_bits.left=gpio_get(GPIO_LEFT);
+			gb.direct.joypad_bits.right=gpio_get(GPIO_RIGHT);
+			gb.direct.joypad_bits.a=gpio_get(GPIO_A);
+			gb.direct.joypad_bits.b=gpio_get(GPIO_B);
+			gb.direct.joypad_bits.select=gpio_get(GPIO_SELECT);
+			gb.direct.joypad_bits.start=gpio_get(GPIO_START);
+
+			/* hotkeys (select + * combo)*/
+			if(!gb.direct.joypad_bits.select) {
+				#if ENABLE_SOUND
+					if(!gb.direct.joypad_bits.up && prev_joypad_bits.up) {
+						/* select + up: increase sound volume */
+						//i2s_increase_volume(&i2s_config);
+						volume+=16;
+						//audio_source_set_volume(0, volume);
+					}
+					if(!gb.direct.joypad_bits.down && prev_joypad_bits.down) {
+						/* select + down: decrease sound volume */
+						//i2s_decrease_volume(&i2s_config);
+						volume-=16;
+						//audio_source_set_volume(0, volume);
+					}
+				#endif
+				if(!gb.direct.joypad_bits.right && prev_joypad_bits.right) {
+					/* select + right: select the next manual color palette */
+					if(manual_palette_selected<12) {
+						manual_palette_selected++;
+						manual_assign_palette(palette,manual_palette_selected);
+					}	
+				}
+				if(!gb.direct.joypad_bits.left && prev_joypad_bits.left) {
+					/* select + left: select the previous manual color palette */
+					if(manual_palette_selected>0) {
+						manual_palette_selected--;
+						manual_assign_palette(palette,manual_palette_selected);
+					}
+				}
+				if(!gb.direct.joypad_bits.start && prev_joypad_bits.start) {
+					/* select + start: save ram and resets to the game selection menu */
+					#if ENABLE_SDCARD				
+						write_cart_ram_file(&gb);
+					#endif				
+					goto out;
+				}
+				if(!gb.direct.joypad_bits.a && prev_joypad_bits.a) {
+					/* select + A: enable/disable frame-skip => fast-forward */
+					gb.direct.frame_skip=!gb.direct.frame_skip;
+					printf("I gb.direct.frame_skip = %d\n",gb.direct.frame_skip);
+				}
+				if (!gb.direct.joypad_bits.b && prev_joypad_bits.b) {
+					/* select + B: Toggle Scaling */
+					while (lcd_line_busy) {true; };
+					st7789_fill(0x0000);				// Clear the screen
+					lcd_scaling++;
+					if (lcd_scaling > 1) lcd_scaling = 0;	// Toggle scaling
+					printf("I scaling toggled\n");
+				}	
+			}
+
+			/* Serial monitor commands */ 
+			input = getchar_timeout_us(0);
+			if(input == PICO_ERROR_TIMEOUT) continue;
+
+			switch(input)
+			{
+				case 'i':
+					gb.direct.interlace = !gb.direct.interlace;
+					break;
+
+				case 'f':
+					gb.direct.frame_skip = !gb.direct.frame_skip;
+					break;
+
+				case 'b':
+				{
+					uint64_t end_time;
+					uint32_t diff;
+					uint32_t fps;
+
+					end_time = time_us_64();
+					diff = end_time-start_time;
+					fps = ((uint64_t)frames*1000*1000)/diff;
+					printf("Frames: %u\n"
+						"Time: %lu us\n"
+						"FPS: %lu\n",
+						frames, diff, fps);
+					stdio_flush();
+					frames = 0;
+					start_time = time_us_64();
+					break;
+				}
+
+				case '\n':
+				case '\r':
+				{
+					gb.direct.joypad_bits.start = 0;
+					break;
+				}
+
+				case '\b':
+				{
+					gb.direct.joypad_bits.select = 0;
+					break;
+				}
+
+				case '8':
+				{
+					gb.direct.joypad_bits.up = 0;
+					break;
+				}
+
+				case '2':
+				{
+					gb.direct.joypad_bits.down = 0;
+					break;
+				}
+
+				case '4':
+				{
+					gb.direct.joypad_bits.left= 0;
+					break;
+				}
+
+				case '6':
+				{
+					gb.direct.joypad_bits.right = 0;
+					break;
+				}
+
+				case 'z':
+				case 'w':
+				{
+					gb.direct.joypad_bits.a = 0;
+					break;
+				}
+
+				case 'x':
+				{
+					gb.direct.joypad_bits.b = 0;
+					break;
+				}
+
+				case 'q':
+					goto out;
+
+				default:
+					break;
+			}
+		}
+		out:
+			puts("\nEmulation Ended");
+			multicore_reset_core1(); 				// stop lcd task running on core 1
+	}
 }
 
 /**
@@ -197,107 +637,10 @@ uint8_t gb_cart_ram_read(struct gb_s *gb, const uint_fast32_t addr)
 /**
  * Writes a given byte to the cartridge RAM at the given address.
  */
-void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr,
-		       const uint8_t val)
+void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr, const uint8_t val)
 {
 	ram[addr] = val;
 }
-
-/**
- * Ignore all errors.
- */
-void gb_error(struct gb_s *gb, const enum gb_error_e gb_err, const uint16_t addr)
-{
-#if 1
-	const char* gb_err_str[4] = {
-			"UNKNOWN",
-			"INVALID OPCODE",
-			"INVALID READ",
-			"INVALID WRITE"
-		};
-	printf("Error %d occurred: %s at %04X\n.\n", gb_err, gb_err_str[gb_err], addr);
-//	abort();
-#endif
-}
-
-#if ENABLE_LCD 
-void core1_lcd_draw_line(const uint_fast8_t line)
-{
-	static uint16_t fb[LCD_WIDTH];
-
-	for(unsigned int x = 0; x < LCD_WIDTH; x++)
-	{
-		fb[x] = palette[(pixels_buffer[x] & LCD_PALETTE_ALL) >> 4]
-				[pixels_buffer[x] & 3];
-	}
-
-	mk_ili9225_set_x(line + 16);
-	mk_ili9225_write_pixels(fb, LCD_WIDTH);
-	__atomic_store_n(&lcd_line_busy, 0, __ATOMIC_SEQ_CST);
-}
-
-_Noreturn
-void main_core1(void)
-{
-	union core_cmd cmd;
-
-	/* Initialise and control LCD on core 1. */
-	mk_ili9225_init();
-
-	/* Clear LCD screen. */
-	mk_ili9225_fill(0x0000);
-
-	/* Set LCD window to DMG size. */
-	mk_ili9225_fill_rect(31,16,LCD_WIDTH,LCD_HEIGHT,0x0000);
-
-	// Sleep used for debugging LCD window.
-	//sleep_ms(1000);
-
-	/* Handle commands coming from core0. */
-	while(1)
-	{
-		cmd.full = multicore_fifo_pop_blocking();
-		switch(cmd.cmd)
-		{
-		case CORE_CMD_LCD_LINE:
-			core1_lcd_draw_line(cmd.data);
-			break;
-
-		case CORE_CMD_IDLE_SET:
-			mk_ili9225_display_control(true, cmd.data);
-			break;
-
-		case CORE_CMD_NOP:
-		default:
-			break;
-		}
-	}
-
-	HEDLEY_UNREACHABLE();
-}
-#endif
-
-#if ENABLE_LCD
-void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[LCD_WIDTH],
-		   const uint_fast8_t line)
-{
-	union core_cmd cmd;
-
-	/* Wait until previous line is sent. */
-	while(__atomic_load_n(&lcd_line_busy, __ATOMIC_SEQ_CST))
-		tight_loop_contents();
-
-	memcpy(pixels_buffer, pixels, LCD_WIDTH);
-	
-	/* Populate command. */
-	cmd.cmd = CORE_CMD_LCD_LINE;
-	cmd.data = line;
-
-	__atomic_store_n(&lcd_line_busy, 1, __ATOMIC_SEQ_CST);
-	multicore_fifo_push_blocking(cmd.full);
-}
-#endif
-
 #if ENABLE_SDCARD
 /**
  * Load a save file from the SD card
@@ -446,7 +789,7 @@ uint16_t rom_file_selector_display_page(char filename[22][256],uint16_t num_page
 
     /* search *.gb files */
 	uint16_t num_file=0;
-	fr=f_findfirst(&dj, &fno, "", "*.gb");
+	fr=f_findfirst(&dj, &fno, "\\gb", "*.gb");
 
 	/* skip the first N pages */
 	if(num_page>0) {
@@ -467,9 +810,9 @@ uint16_t rom_file_selector_display_page(char filename[22][256],uint16_t num_page
 	f_unmount(pSD->pcName);
 
 	/* display *.gb rom files on screen */
-	mk_ili9225_fill(0x0000);
+	st7789_fill(0x0000);
 	for(uint8_t ifile=0;ifile<num_file;ifile++) {
-		mk_ili9225_text(filename[ifile],0,ifile*8,0xFFFF,0x0000);
+		st7789_text(filename[ifile],0,ifile*8,0xFFFF,0x0000);
     }
 	return num_file;
 }
@@ -489,7 +832,7 @@ void rom_file_selector() {
 
 	/* select the first rom */
 	uint8_t selected=0;
-	mk_ili9225_text(filename[selected],0,selected*8,0xFFFF,0xF800);
+	st7789_text(filename[selected],0,selected*8,0xFFFF,0xF800);
 
 	/* get user's input */
 	bool up,down,left,right,a,b,select,start;
@@ -508,26 +851,26 @@ void rom_file_selector() {
 		}
 		if(!a | !b) {
 			/* copy the rom from the SD card to flash and start the game */
-			load_cart_rom_file(filename[selected]);
+			load_cart_rom_file(strcat("\\gb\\", filename[selected]));
 			break;
 		}
 		if(!down) {
 			/* select the next rom */
-			mk_ili9225_text(filename[selected],0,selected*8,0xFFFF,0x0000);
+			st7789_text(filename[selected],0,selected*8,0xFFFF,0x0000);
 			selected++;
 			if(selected>=num_file) selected=0;
-			mk_ili9225_text(filename[selected],0,selected*8,0xFFFF,0xF800);
+			st7789_text(filename[selected],0,selected*8,0xFFFF,0xF800);
 			sleep_ms(150);
 		}
 		if(!up) {
 			/* select the previous rom */
-			mk_ili9225_text(filename[selected],0,selected*8,0xFFFF,0x0000);
+			st7789_text(filename[selected],0,selected*8,0xFFFF,0x0000);
 			if(selected==0) {
 				selected=num_file-1;
 			} else {
 				selected--;
 			}
-			mk_ili9225_text(filename[selected],0,selected*8,0xFFFF,0xF800);
+			st7789_text(filename[selected],0,selected*8,0xFFFF,0xF800);
 			sleep_ms(150);
 		}
 		if(!right) {
@@ -541,7 +884,7 @@ void rom_file_selector() {
 			}
 			/* select the first file */
 			selected=0;
-			mk_ili9225_text(filename[selected],0,selected*8,0xFFFF,0xF800);
+			st7789_text(filename[selected],0,selected*8,0xFFFF,0xF800);
 			sleep_ms(150);
 		}
 		if((!left) && num_page>0) {
@@ -550,7 +893,7 @@ void rom_file_selector() {
 			num_file=rom_file_selector_display_page(filename,num_page);
 			/* select the first file */
 			selected=0;
-			mk_ili9225_text(filename[selected],0,selected*8,0xFFFF,0xF800);
+			st7789_text(filename[selected],0,selected*8,0xFFFF,0xF800);
 			sleep_ms(150);
 		}
 		tight_loop_contents();
@@ -559,344 +902,3 @@ void rom_file_selector() {
 
 #endif
 
-int main(void)
-{
-	static struct gb_s gb;
-	enum gb_init_error_e ret;
-	
-	/* Overclock. */
-	{
-		const unsigned vco = 1596*1000*1000;	/* 266MHz */
-		const unsigned div1 = 6, div2 = 1;
-
-		vreg_set_voltage(VREG_VOLTAGE_1_15);
-		sleep_ms(2);
-		set_sys_clock_pll(vco, div1, div2);
-		sleep_ms(2);
-	}
-
-	/* Initialise USB serial connection for debugging. */
-	stdio_init_all();
-	time_init();
-	// sleep_ms(5000);
-	putstdio("INIT: ");
-
-	/* Initialise GPIO pins. */
-	gpio_set_function(GPIO_UP, GPIO_FUNC_SIO);
-	gpio_set_function(GPIO_DOWN, GPIO_FUNC_SIO);
-	gpio_set_function(GPIO_LEFT, GPIO_FUNC_SIO);
-	gpio_set_function(GPIO_RIGHT, GPIO_FUNC_SIO);
-	gpio_set_function(GPIO_A, GPIO_FUNC_SIO);
-	gpio_set_function(GPIO_B, GPIO_FUNC_SIO);
-	gpio_set_function(GPIO_SELECT, GPIO_FUNC_SIO);
-	gpio_set_function(GPIO_START, GPIO_FUNC_SIO);
-	gpio_set_function(GPIO_CS, GPIO_FUNC_SIO);
-	gpio_set_function(GPIO_CLK, GPIO_FUNC_SPI);
-	gpio_set_function(GPIO_SDA, GPIO_FUNC_SPI);
-	gpio_set_function(GPIO_RS, GPIO_FUNC_SIO);
-	gpio_set_function(GPIO_RST, GPIO_FUNC_SIO);
-	gpio_set_function(GPIO_LED, GPIO_FUNC_SIO);
-
-	gpio_set_dir(GPIO_UP, false);
-	gpio_set_dir(GPIO_DOWN, false);
-	gpio_set_dir(GPIO_LEFT, false);
-	gpio_set_dir(GPIO_RIGHT, false);
-	gpio_set_dir(GPIO_A, false);
-	gpio_set_dir(GPIO_B, false);
-	gpio_set_dir(GPIO_SELECT, false);
-	gpio_set_dir(GPIO_START, false);
-	gpio_set_dir(GPIO_CS, true);
-	gpio_set_dir(GPIO_RS, true);
-	gpio_set_dir(GPIO_RST, true);
-	gpio_set_dir(GPIO_LED, true);
-	gpio_set_slew_rate(GPIO_CLK, GPIO_SLEW_RATE_FAST);
-	gpio_set_slew_rate(GPIO_SDA, GPIO_SLEW_RATE_FAST);
-	
-	gpio_pull_up(GPIO_UP);
-	gpio_pull_up(GPIO_DOWN);
-	gpio_pull_up(GPIO_LEFT);
-	gpio_pull_up(GPIO_RIGHT);
-	gpio_pull_up(GPIO_A);
-	gpio_pull_up(GPIO_B);
-	gpio_pull_up(GPIO_SELECT);
-	gpio_pull_up(GPIO_START);
-
-	/* Set SPI clock to use high frequency. */
-	clock_configure(clk_peri, 0,
-			CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
-			125 * 1000 * 1000, 125 * 1000 * 1000);
-	spi_init(spi0, 30*1000*1000);
-	spi_set_format(spi0, 16, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
-
-#if ENABLE_SOUND
-	// Allocate memory for the stream buffer
-	stream=malloc(AUDIO_BUFFER_SIZE_BYTES);
-    assert(stream!=NULL);
-    memset(stream,0,AUDIO_BUFFER_SIZE_BYTES);  // Zero out the stream buffer
-	
-	// Initialize I2S sound driver
-	i2s_config_t i2s_config = i2s_get_default_config();
-	i2s_config.sample_freq=AUDIO_SAMPLE_RATE;
-	i2s_config.dma_trans_count =AUDIO_SAMPLES;
-	i2s_volume(&i2s_config,2);
-	i2s_init(&i2s_config);
-#endif
-
-while(true)
-{
-#if ENABLE_LCD
-#if ENABLE_SDCARD
-	/* ROM File selector */
-	mk_ili9225_init();
-	mk_ili9225_fill(0x0000);
-	rom_file_selector();
-#endif
-#endif
-
-	/* Initialise GB context. */
-	memcpy(rom_bank0, rom, sizeof(rom_bank0));
-	ret = gb_init(&gb, &gb_rom_read, &gb_cart_ram_read,
-		      &gb_cart_ram_write, &gb_error, NULL);
-	putstdio("GB ");
-
-	if(ret != GB_INIT_NO_ERROR)
-	{
-		printf("Error: %d\n", ret);
-		goto out;
-	}
-
-	/* Automatically assign a colour palette to the game */
-	char rom_title[16];
-	auto_assign_palette(palette, gb_colour_hash(&gb),gb_get_rom_name(&gb,rom_title));
-	
-#if ENABLE_LCD
-	gb_init_lcd(&gb, &lcd_draw_line);
-
-	/* Start Core1, which processes requests to the LCD. */
-	putstdio("CORE1 ");
-	multicore_launch_core1(main_core1);
-	
-	putstdio("LCD ");
-#endif
-
-#if ENABLE_SOUND
-	// Initialize audio emulation
-	audio_init();
-	
-	putstdio("AUDIO ");
-#endif
-
-#if ENABLE_SDCARD
-	/* Load Save File. */
-	read_cart_ram_file(&gb);
-#endif
-
-	putstdio("\n> ");
-	uint_fast32_t frames = 0;
-	uint64_t start_time = time_us_64();
-	while(1)
-	{
-		int input;
-
-		gb.gb_frame = 0;
-
-		do {
-			__gb_step_cpu(&gb);
-			tight_loop_contents();
-		} while(HEDLEY_LIKELY(gb.gb_frame == 0));
-
-		frames++;
-#if ENABLE_SOUND
-		if(!gb.direct.frame_skip) {
-			audio_callback(NULL, stream, AUDIO_BUFFER_SIZE_BYTES);
-			i2s_dma_write(&i2s_config, stream);
-		}
-#endif
-
-		/* Update buttons state */
-		prev_joypad_bits.up=gb.direct.joypad_bits.up;
-		prev_joypad_bits.down=gb.direct.joypad_bits.down;
-		prev_joypad_bits.left=gb.direct.joypad_bits.left;
-		prev_joypad_bits.right=gb.direct.joypad_bits.right;
-		prev_joypad_bits.a=gb.direct.joypad_bits.a;
-		prev_joypad_bits.b=gb.direct.joypad_bits.b;
-		prev_joypad_bits.select=gb.direct.joypad_bits.select;
-		prev_joypad_bits.start=gb.direct.joypad_bits.start;
-		gb.direct.joypad_bits.up=gpio_get(GPIO_UP);
-		gb.direct.joypad_bits.down=gpio_get(GPIO_DOWN);
-		gb.direct.joypad_bits.left=gpio_get(GPIO_LEFT);
-		gb.direct.joypad_bits.right=gpio_get(GPIO_RIGHT);
-		gb.direct.joypad_bits.a=gpio_get(GPIO_A);
-		gb.direct.joypad_bits.b=gpio_get(GPIO_B);
-		gb.direct.joypad_bits.select=gpio_get(GPIO_SELECT);
-		gb.direct.joypad_bits.start=gpio_get(GPIO_START);
-
-		/* hotkeys (select + * combo)*/
-		if(!gb.direct.joypad_bits.select) {
-#if ENABLE_SOUND
-			if(!gb.direct.joypad_bits.up && prev_joypad_bits.up) {
-				/* select + up: increase sound volume */
-				i2s_increase_volume(&i2s_config);
-			}
-			if(!gb.direct.joypad_bits.down && prev_joypad_bits.down) {
-				/* select + down: decrease sound volume */
-				i2s_decrease_volume(&i2s_config);
-			}
-#endif
-			if(!gb.direct.joypad_bits.right && prev_joypad_bits.right) {
-				/* select + right: select the next manual color palette */
-				if(manual_palette_selected<12) {
-					manual_palette_selected++;
-					manual_assign_palette(palette,manual_palette_selected);
-				}	
-			}
-			if(!gb.direct.joypad_bits.left && prev_joypad_bits.left) {
-				/* select + left: select the previous manual color palette */
-				if(manual_palette_selected>0) {
-					manual_palette_selected--;
-					manual_assign_palette(palette,manual_palette_selected);
-				}
-			}
-			if(!gb.direct.joypad_bits.start && prev_joypad_bits.start) {
-				/* select + start: save ram and resets to the game selection menu */
-#if ENABLE_SDCARD				
-				write_cart_ram_file(&gb);
-#endif				
-				goto out;
-			}
-			if(!gb.direct.joypad_bits.a && prev_joypad_bits.a) {
-				/* select + A: enable/disable frame-skip => fast-forward */
-				gb.direct.frame_skip=!gb.direct.frame_skip;
-				printf("I gb.direct.frame_skip = %d\n",gb.direct.frame_skip);
-			}
-		}
-
-		/* Serial monitor commands */ 
-		input = getchar_timeout_us(0);
-		if(input == PICO_ERROR_TIMEOUT)
-			continue;
-
-		switch(input)
-		{
-#if 0
-		static bool invert = false;
-		static bool sleep = false;
-		static uint8_t freq = 1;
-		static ili9225_color_mode_e colour = ILI9225_COLOR_MODE_FULL;
-
-		case 'i':
-			invert = !invert;
-			mk_ili9225_display_control(invert, colour);
-			break;
-
-		case 'f':
-			freq++;
-			freq &= 0x0F;
-			mk_ili9225_set_drive_freq(freq);
-			printf("Freq %u\n", freq);
-			break;
-#endif
-		case 'c':
-		{
-			static ili9225_color_mode_e mode = ILI9225_COLOR_MODE_FULL;
-			union core_cmd cmd;
-
-			mode = !mode;
-			cmd.cmd = CORE_CMD_IDLE_SET;
-			cmd.data = mode;
-			multicore_fifo_push_blocking(cmd.full);
-			break;
-		}
-
-		case 'i':
-			gb.direct.interlace = !gb.direct.interlace;
-			break;
-
-		case 'f':
-			gb.direct.frame_skip = !gb.direct.frame_skip;
-			break;
-
-		case 'b':
-		{
-			uint64_t end_time;
-			uint32_t diff;
-			uint32_t fps;
-
-			end_time = time_us_64();
-			diff = end_time-start_time;
-			fps = ((uint64_t)frames*1000*1000)/diff;
-			printf("Frames: %u\n"
-				"Time: %lu us\n"
-				"FPS: %lu\n",
-				frames, diff, fps);
-			stdio_flush();
-			frames = 0;
-			start_time = time_us_64();
-			break;
-		}
-
-		case '\n':
-		case '\r':
-		{
-			gb.direct.joypad_bits.start = 0;
-			break;
-		}
-
-		case '\b':
-		{
-			gb.direct.joypad_bits.select = 0;
-			break;
-		}
-
-		case '8':
-		{
-			gb.direct.joypad_bits.up = 0;
-			break;
-		}
-
-		case '2':
-		{
-			gb.direct.joypad_bits.down = 0;
-			break;
-		}
-
-		case '4':
-		{
-			gb.direct.joypad_bits.left= 0;
-			break;
-		}
-
-		case '6':
-		{
-			gb.direct.joypad_bits.right = 0;
-			break;
-		}
-
-		case 'z':
-		case 'w':
-		{
-			gb.direct.joypad_bits.a = 0;
-			break;
-		}
-
-		case 'x':
-		{
-			gb.direct.joypad_bits.b = 0;
-			break;
-		}
-
-		case 'q':
-			goto out;
-
-		default:
-			break;
-		}
-	}
-out:
-	puts("\nEmulation Ended");
-	/* stop lcd task running on core 1 */
-	multicore_reset_core1(); 
-
-}
-
-}

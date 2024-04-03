@@ -11,10 +11,12 @@ pico_sdk_init()
 add_subdirectory(ext/FatFs_SPI build)
 
 add_executable(RP2040_GB
+        src/pico_ST7789.c
+        src/lcd_dma.c
         src/main.c
-        src/mk_ili9225.c
+        src/gb3_audio_dma.c
+        src/audio.c
         ext/minigb_apu/minigb_apu.c
-        ext/i2s/i2s.c
 )
 
 pico_generate_pio_header(RP2040_GB ${CMAKE_CURRENT_LIST_DIR}/ext/i2s/audio_i2s.pio)
@@ -25,7 +27,7 @@ target_link_libraries(RP2040_GB
         FatFs_SPI
         pico_stdlib pico_stdio pico_bootrom pico_multicore pico_stdio  pico_multicore
         hardware_clocks hardware_pio hardware_vreg hardware_pio
-        hardware_sync hardware_pll hardware_spi hardware_irq hardware_dma
+        hardware_sync hardware_pll hardware_spi hardware_irq hardware_dma hardware_pwm
         pico_binary_info)
 target_compile_definitions(RP2040_GB PRIVATE
         PARAM_ASSERTIONS_DISABLE_ALL=1
